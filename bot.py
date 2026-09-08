@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# --- СЧИТЫВАНИЕ ДАННЫХ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
+# --- КОНФИГУРАЦИЯ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))
@@ -15,27 +15,25 @@ MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+
 # --- FSM (СОСТОЯНИЯ АНКЕТЫ) ---
 class AdForm(StatesGroup):
     category = State()
     location = State()
     content = State()
+    confirmation = State()  # Шаг подтверждения перед отправкой
 
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И КЛАВИАТУРЫ ---
 
-# Проверка подписки пользователя на канал
 async def check_subscription(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        # Статусы, означающие, что человек состоит в канале
         return member.status not in ("left", "kicked")
     except Exception:
-        # Если бот не может проверить (например, не добавлен в админы)
         return False
 
 
-# Клавиатура с предложением подписаться
 def get_subscribe_keyboard():
     channel_clean = CHANNEL_ID.lstrip("@")
     builder = InlineKeyboardBuilder()
@@ -45,7 +43,6 @@ def get_subscribe_keyboard():
     return builder.as_markup()
 
 
-# Клавиатура выбора категории
 def get_category_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🎁 Отдам даром", callback_data="cat:#отдам_даром")
@@ -54,11 +51,25 @@ def get_category_keyboard():
     return builder.as_markup()
 
 
-# Запуск создания объявления
+def get_new_ad_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📝 Подать ещё одно объявление", callback_data="new_ad")
+    return builder.as_markup()
+
+
+# Кнопки подтверждения перед модерацией
+def get_confirmation_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚀 Отправить на модерацию", callback_data="confirm_send")
+    builder.button(text="🔄 Заполнить заново", callback_data="restart_ad")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 async def start_ad_creation(target: types.Message | types.CallbackQuery, state: FSMContext):
     text = (
-        "👋 Здравствуйте! Давайте создадим объявление.\n\n"
-        "Шаг 1 из 3: Выберите подходящую категорию:"
+        "👋 Давайте создадим объявление!\n\n"
+        "Шаг 1 из 3: Выберите категорию:"
     )
     if isinstance(target, types.CallbackQuery):
         await target.message.answer(text, reply_markup=get_category_keyboard())
@@ -77,7 +88,7 @@ async def start_handler(message: types.Message, state: FSMContext):
     if not is_subscribed:
         await message.answer(
             "⚠️ Подача объявлений доступна <b>только подписчикам</b> нашего канала.\n\n"
-            "Пожалуйста, подпишитесь на канал и нажмите кнопку <b>«Я подписался»</b> ниже:",
+            "Пожалуйста, подпишитесь на канал и нажмите кнопку <b>«Я подписался»</b>:",
             parse_mode="HTML",
             reply_markup=get_subscribe_keyboard()
         )
@@ -86,13 +97,16 @@ async def start_handler(message: types.Message, state: FSMContext):
     await start_ad_creation(message, state)
 
 
-# Обработка клика по кнопке «Я подписался»
-@dp.callback_query(F.data == "check_sub")
-async def check_sub_callback(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.in_({"check_sub", "new_ad", "restart_ad"}))
+async def sub_or_new_ad_callback(callback: types.CallbackQuery, state: FSMContext):
     is_subscribed = await check_subscription(callback.from_user.id)
 
     if is_subscribed:
-        await callback.message.delete()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await state.clear()
         await start_ad_creation(callback, state)
     else:
         await callback.answer("❌ Вы ещё не подписались на канал!", show_alert=True)
@@ -101,7 +115,10 @@ async def check_sub_callback(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(Command("cancel"), F.chat.type == "private")
 async def cancel_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Заполнение объявления отменено. Чтобы начать заново, отправьте /start.")
+    await message.answer(
+        "❌ Заполнение отменено.",
+        reply_markup=get_new_ad_keyboard()
+    )
 
 
 # --- ШАГИ АНКЕТЫ ---
@@ -126,7 +143,7 @@ async def location_chosen(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text.strip())
     await message.answer(
         "Шаг 3 из 3: Отправьте <b>описание объявления</b>.\n\n"
-        "💡 Вы можете прислать просто текст или <b>фотографию с описанием</b>.",
+        "💡 Вы можете прислать текст или <b>фотографию с описанием</b>.",
         parse_mode="HTML"
     )
     await state.set_state(AdForm.content)
@@ -134,20 +151,6 @@ async def location_chosen(message: types.Message, state: FSMContext):
 
 @dp.message(AdForm.content, F.photo | F.text)
 async def content_received(message: types.Message, state: FSMContext):
-    # Дополнительная страховочная проверка подписки перед отправкой на модерацию
-    if not await check_subscription(message.from_user.id):
-        await state.clear()
-        await message.answer(
-            "⚠️ Вы отписались от канала в процессе заполнения. "
-            "Пожалуйста, подпишитесь снова, чтобы отправить объявление:",
-            reply_markup=get_subscribe_keyboard()
-        )
-        return
-
-    data = await state.get_data()
-    category = data["category"]
-    location = html.escape(data["location"])
-
     photo_id = None
     if message.photo:
         photo_id = message.photo[-1].file_id
@@ -157,20 +160,68 @@ async def content_received(message: types.Message, state: FSMContext):
 
     user_description = html.escape(raw_text)
 
-    # Собираем пост
+    # Сохраняем контент в памяти
+    await state.update_data(photo_id=photo_id, description=user_description)
+    data = await state.get_data()
+
+    # Формируем текст предпросмотра
+    preview_text = (
+        "👀 <b>Проверьте ваше объявление перед отправкой:</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"{data['category']}\n\n"
+        f"📍 <b>Метро / Район:</b> {html.escape(data['location'])}\n\n"
+        f"{user_description}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Если всё верно, нажмите кнопку внизу:"
+    )
+
+    if photo_id:
+        await message.answer_photo(
+            photo=photo_id,
+            caption=preview_text,
+            parse_mode="HTML",
+            reply_markup=get_confirmation_keyboard()
+        )
+    else:
+        await message.answer(
+            text=preview_text,
+            parse_mode="HTML",
+            reply_markup=get_confirmation_keyboard()
+        )
+
+    await state.set_state(AdForm.confirmation)
+
+
+# --- ПОДТВЕРЖДЕНИЕ И ОТПРАВКА НА МОДЕРАЦИЮ ---
+
+@dp.callback_query(AdForm.confirmation, F.data == "confirm_send")
+async def confirm_send_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_subscription(callback.from_user.id):
+        await state.clear()
+        await callback.message.answer(
+            "⚠️ Вы не подписаны на канал. Подпишитесь, чтобы отправить объявление:",
+            reply_markup=get_subscribe_keyboard()
+        )
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    category = data["category"]
+    location = html.escape(data["location"])
+    user_description = data["description"]
+    photo_id = data.get("photo_id")
+
     formatted_ad = (
         f"{category}\n\n"
         f"📍 <b>Метро / Район:</b> {location}\n\n"
         f"{user_description}"
     )
 
-    # Кнопки для админов
     mod_kb = InlineKeyboardBuilder()
-    mod_kb.button(text="✅ Одобрить", callback_data=f"ok:{message.from_user.id}")
-    mod_kb.button(text="❌ Отклонить", callback_data=f"no:{message.from_user.id}")
+    mod_kb.button(text="✅ Одобрить", callback_data=f"ok:{callback.from_user.id}")
+    mod_kb.button(text="❌ Отклонить", callback_data=f"no:{callback.from_user.id}")
     mod_kb.adjust(2)
 
-    # Пересылаем модераторам
     if photo_id:
         await bot.send_photo(
             chat_id=MODERATION_CHAT_ID,
@@ -187,10 +238,23 @@ async def content_received(message: types.Message, state: FSMContext):
             reply_markup=mod_kb.as_markup()
         )
 
+    await callback.message.edit_reply_markup(reply_markup=None)
     await state.clear()
+
+    await callback.message.answer(
+        "🎉 Спасибо! Ваше объявление передано модераторам.\n"
+        "Когда его проверят, вы получите уведомление.",
+        reply_markup=get_new_ad_keyboard()
+    )
+    await callback.answer()
+
+
+# Ответ на случайное сообщение вне анкеты
+@dp.message(F.chat.type == "private")
+async def fallback_handler(message: types.Message):
     await message.answer(
-        "🎉 Спасибо! Ваше объявление оформлено и передано модераторам.\n"
-        "Когда его проверят, вы получите уведомление."
+        "Чтобы подать объявление, нажмите кнопку ниже или отправьте команду /start:",
+        reply_markup=get_new_ad_keyboard()
     )
 
 
@@ -213,7 +277,6 @@ async def approve_handler(callback: types.CallbackQuery):
     else:
         post_kb.button(text="💬 Написать автору", url=f"tg://openmessage?user_id={author_id}")
 
-    # Публикуем в публичный канал
     await bot.copy_message(
         chat_id=CHANNEL_ID,
         from_chat_id=callback.message.chat.id,
@@ -227,7 +290,7 @@ async def approve_handler(callback: types.CallbackQuery):
         pass
 
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.reply(f"✅ Опубликовано модератором {callback.from_user.first_name}")
+    await callback.message.reply(f"✅ Опубликовано ({callback.from_user.first_name})")
     await callback.answer()
 
 
@@ -242,11 +305,15 @@ async def reject_handler(callback: types.CallbackQuery):
         pass
 
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.reply(f"❌ Отклонено модератором {callback.from_user.first_name}")
+    await callback.message.reply(f"❌ Отклонено ({callback.from_user.first_name})")
     await callback.answer()
 
 
 async def main():
+    await bot.set_my_commands([
+        types.BotCommand(command="start", description="Подать объявление"),
+        types.BotCommand(command="cancel", description="Отменить заполнение")
+    ])
     print("Бот успешно запущен...")
     await dp.start_polling(bot)
 
