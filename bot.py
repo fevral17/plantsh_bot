@@ -36,7 +36,6 @@ class AlbumMiddleware(BaseMiddleware):
         event: types.Message,
         data: Dict[str, Any]
     ) -> Any:
-        # Альбомы объединяем только в личке с пользователем, чтобы не ломать чат комментариев
         if event.chat.type != "private" or not event.media_group_id:
             data["album"] = None
             return await handler(event, data)
@@ -61,7 +60,6 @@ def init_db():
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
 
-    # Хранилище поданных объявлений
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ads_storage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +73,6 @@ def init_db():
         )
     """)
 
-    # Таблица очереди постов
     cur.execute("PRAGMA table_info(scheduled_posts)")
     cols = [r[1] for r in cur.fetchall()]
     if cols and "ad_id" not in cols:
@@ -91,15 +88,19 @@ def init_db():
         )
     """)
 
-    # Хранилище ID сообщений в канале для чистого удаления альбомов
+    # Хранилище опубликованных постов с текстом для подтверждения удаления
     cur.execute("""
         CREATE TABLE IF NOT EXISTS published_ads (
             lead_channel_msg_id INTEGER PRIMARY KEY,
-            all_channel_msg_ids TEXT
+            all_channel_msg_ids TEXT,
+            snippet TEXT
         )
     """)
+    try:
+        cur.execute("ALTER TABLE published_ads ADD COLUMN snippet TEXT DEFAULT ''")
+    except Exception:
+        pass
 
-    # Связка канала и чата обсуждений
     cur.execute("""
         CREATE TABLE IF NOT EXISTS post_comments_map (
             channel_msg_id INTEGER PRIMARY KEY,
@@ -195,23 +196,23 @@ def delete_scheduled_post(post_id: int):
     conn.commit()
     conn.close()
 
-def save_published_ad(lead_channel_msg_id: int, all_channel_msg_ids: str):
+def save_published_ad(lead_channel_msg_id: int, all_channel_msg_ids: str, snippet: str = ""):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO published_ads (lead_channel_msg_id, all_channel_msg_ids)
-        VALUES (?, ?)
-    """, (lead_channel_msg_id, all_channel_msg_ids))
+        INSERT OR REPLACE INTO published_ads (lead_channel_msg_id, all_channel_msg_ids, snippet)
+        VALUES (?, ?, ?)
+    """, (lead_channel_msg_id, all_channel_msg_ids, snippet))
     conn.commit()
     conn.close()
 
-def get_published_ad_ids(lead_channel_msg_id: int):
+def get_published_ad(lead_channel_msg_id: int):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
-    cur.execute("SELECT all_channel_msg_ids FROM published_ads WHERE lead_channel_msg_id = ?", (lead_channel_msg_id,))
+    cur.execute("SELECT all_channel_msg_ids, snippet FROM published_ads WHERE lead_channel_msg_id = ?", (lead_channel_msg_id,))
     row = cur.fetchone()
     conn.close()
-    return row[0] if row else None
+    return row
 
 def delete_published_ad(lead_channel_msg_id: int):
     conn = sqlite3.connect("bot_data.db")
@@ -378,7 +379,7 @@ async def publish_ad_to_channel(ad_id: int):
 
     lead_id = channel_msg_ids[0]
     all_ids_str = ",".join(str(i) for i in channel_msg_ids)
-    save_published_ad(lead_channel_msg_id=lead_id, all_channel_msg_ids=all_ids_str)
+    save_published_ad(lead_channel_msg_id=lead_id, all_channel_msg_ids=all_ids_str, snippet=snippet or "")
 
     del_kb = InlineKeyboardBuilder()
     del_kb.button(text="🗑 Удалить объявление из канала", callback_data=f"del_pub:{lead_id}")
@@ -422,12 +423,14 @@ async def capture_discussion_forward(message: types.Message):
 @dp.callback_query(F.data.startswith("del_pub:"))
 async def delete_published_ad_callback(callback: types.CallbackQuery):
     lead_id = int(callback.data.split(":")[1])
-    all_ids_str = get_published_ad_ids(lead_id)
+    pub_data = get_published_ad(lead_id)
 
-    if all_ids_str:
+    if pub_data:
+        all_ids_str, snippet = pub_data
         channel_msg_ids = [int(x) for x in all_ids_str.split(",") if x.strip()]
     else:
         channel_msg_ids = [lead_id]
+        snippet = ""
 
     deleted_any = False
 
@@ -450,7 +453,16 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
     delete_published_ad(lead_id)
 
     if deleted_any:
-        await callback.message.edit_text("✅ Ваше объявление успешно удалено из канала и комментариев.")
+        quote_block = ""
+        if snippet:
+            raw_snippet = snippet.strip()
+            short_snippet = raw_snippet[:180] + "..." if len(raw_snippet) > 180 else raw_snippet
+            quote_block = f"\n\n🌿 <b>Удалённое объявление:</b>\n<blockquote>{html.escape(short_snippet)}</blockquote>"
+
+        await callback.message.edit_text(
+            f"✅ Ваше объявление успешно удалено из канала и комментариев.{quote_block}",
+            parse_mode="HTML"
+        )
         await callback.answer("Объявление удалено!")
     else:
         await callback.answer("⚠️ Не удалось удалить (возможно, оно уже было удалено).", show_alert=True)
@@ -1027,7 +1039,7 @@ async def main():
         types.BotCommand(command="start", description="Подать объявление"),
         types.BotCommand(command="cancel", description="Отменить заполнение")
     ])
-    print("Бот успешно запущен с поддержкой альбомов до 10 фото...")
+    print("Бот успешно запущен...")
     await dp.start_polling(bot)
 
 
