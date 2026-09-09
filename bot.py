@@ -21,7 +21,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ (ОЧЕРЕДЬ) ---
 
 def init_db():
     conn = sqlite3.connect("bot_data.db")
@@ -37,7 +37,6 @@ def init_db():
             snippet TEXT
         )
     """)
-    # Мягкая миграция: добавляем колонку snippet, если база уже существовала
     try:
         cur.execute("ALTER TABLE scheduled_posts ADD COLUMN snippet TEXT DEFAULT ''")
     except Exception:
@@ -174,34 +173,27 @@ def get_reschedule_keyboard(post_id: int):
     return builder.as_markup()
 
 
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ССЫЛКИ НА АВТОРА ---
+
+def get_author_mention(user: types.User) -> str:
+    if user.username:
+        return f"@{user.username}"
+    return f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
+
+
 # --- ЛОГИКА ПУБЛИКАЦИИ, УДАЛЕНИЯ И ПЛАНИРОВЩИКА ---
 
 async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: int, author_id: int, snippet: str = ""):
-    try:
-        author_chat = await bot.get_chat(author_id)
-        author_username = author_chat.username
-    except Exception:
-        author_username = None
-
-    post_kb = InlineKeyboardBuilder()
-    if author_username:
-        post_kb.button(text="💬 Написать автору", url=f"https://t.me/{author_username}")
-    else:
-        post_kb.button(text="💬 Написать автору", url=f"tg://openmessage?user_id={author_id}")
-
-    # Публикация в канал
+    # Публикация в канал без инлайн-кнопки (контакты уже внутри текста, а плашка комментариев видна сразу)
     sent_msg = await bot.copy_message(
         chat_id=channel_id,
         from_chat_id=from_chat_id,
-        message_id=message_id,
-        reply_markup=post_kb.as_markup()
+        message_id=message_id
     )
 
-    # Кнопка удаления для автора
     del_kb = InlineKeyboardBuilder()
     del_kb.button(text="🗑 Удалить объявление из канала", callback_data=f"del_pub:{sent_msg.message_id}")
 
-    # Формируем блок выжимки
     preview_block = ""
     if snippet:
         raw_snippet = snippet.strip()
@@ -334,12 +326,15 @@ async def content_received(message: types.Message, state: FSMContext):
     await state.update_data(photo_id=photo_id, description=user_description)
     data = await state.get_data()
 
+    author_mention = get_author_mention(message.from_user)
+
     preview_text = (
         "👀 <b>Проверьте ваше объявление перед отправкой:</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{data['category']}\n\n"
         f"📍 <b>Метро / Район:</b> {html.escape(data['location'])}\n\n"
-        f"{user_description}\n"
+        f"{user_description}\n\n"
+        f"👤 <b>Контакты:</b> {author_mention}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Если всё верно, нажмите кнопку внизу:"
     )
@@ -375,11 +370,13 @@ async def confirm_send_callback(callback: types.CallbackQuery, state: FSMContext
     location = html.escape(data["location"])
     user_description = data["description"]
     photo_id = data.get("photo_id")
+    author_mention = get_author_mention(callback.from_user)
 
     formatted_ad = (
         f"{category}\n\n"
         f"📍 <b>Метро / Район:</b> {location}\n\n"
-        f"{user_description}"
+        f"{user_description}\n\n"
+        f"👤 <b>Контакты:</b> {author_mention}"
     )
 
     mod_kb = get_initial_mod_keyboard(callback.from_user.id)
@@ -760,7 +757,7 @@ async def main():
         types.BotCommand(command="start", description="Подать объявление"),
         types.BotCommand(command="cancel", description="Отменить заполнение")
     ])
-    print("Бот успешно запущен с поддержкой очередей, удаления и предпросмотра...")
+    print("Бот успешно запущен: контакты в посте, комментарии активны...")
     await dp.start_polling(bot)
 
 
