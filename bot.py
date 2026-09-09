@@ -1,10 +1,12 @@
 import asyncio
 import datetime
 import html
+import json
 import os
 import re
 import sqlite3
-from aiogram import Bot, Dispatcher, F, types
+from typing import Any, Awaitable, Callable, Dict
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -21,30 +23,83 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+# --- СБОРЩИК МЕДИА-ГРУПП (АЛЬБОМОВ) ---
+
+class AlbumMiddleware(BaseMiddleware):
+    def __init__(self, latency: float = 0.6):
+        self.latency = latency
+        self.albums: Dict[str, list[types.Message]] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[types.Message, Dict[str, Any]], Awaitable[Any]],
+        event: types.Message,
+        data: Dict[str, Any]
+    ) -> Any:
+        # Альбомы объединяем только в личке с пользователем, чтобы не ломать чат комментариев
+        if event.chat.type != "private" or not event.media_group_id:
+            data["album"] = None
+            return await handler(event, data)
+
+        mg_id = event.media_group_id
+        if mg_id not in self.albums:
+            self.albums[mg_id] = [event]
+            await asyncio.sleep(self.latency)
+            album_messages = self.albums.pop(mg_id, [])
+            data["album"] = album_messages
+            return await handler(event, data)
+        else:
+            self.albums[mg_id].append(event)
+            return
+
+dp.message.outer_middleware(AlbumMiddleware())
+
+
 # --- РАБОТА С БАЗОЙ ДАННЫХ ---
 
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
-    
-    # Таблица отложенных публикаций
+
+    # Хранилище поданных объявлений
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS scheduled_posts (
+        CREATE TABLE IF NOT EXISTS ads_storage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id TEXT,
-            from_chat_id INTEGER,
-            message_id INTEGER,
             author_id INTEGER,
-            publish_timestamp INTEGER,
+            category TEXT,
+            location TEXT,
+            description TEXT,
+            photos_json TEXT,
+            formatted_ad TEXT,
             snippet TEXT
         )
     """)
-    try:
-        cur.execute("ALTER TABLE scheduled_posts ADD COLUMN snippet TEXT DEFAULT ''")
-    except Exception:
-        pass
 
-    # Таблица связки поста в канале с постом в чате комментариев
+    # Таблица очереди постов
+    cur.execute("PRAGMA table_info(scheduled_posts)")
+    cols = [r[1] for r in cur.fetchall()]
+    if cols and "ad_id" not in cols:
+        cur.execute("DROP TABLE IF EXISTS scheduled_posts")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ad_id INTEGER,
+            publish_timestamp INTEGER,
+            mod_chat_id INTEGER,
+            mod_msg_id INTEGER
+        )
+    """)
+
+    # Хранилище ID сообщений в канале для чистого удаления альбомов
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS published_ads (
+            lead_channel_msg_id INTEGER PRIMARY KEY,
+            all_channel_msg_ids TEXT
+        )
+    """)
+
+    # Связка канала и чата обсуждений
     cur.execute("""
         CREATE TABLE IF NOT EXISTS post_comments_map (
             channel_msg_id INTEGER PRIMARY KEY,
@@ -56,13 +111,47 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_scheduled_post(channel_id: str, from_chat_id: int, message_id: int, author_id: int, publish_timestamp: int, snippet: str = "") -> int:
+def save_ad(author_id: int, category: str, location: str, description: str, photos: list[str], formatted_ad: str, snippet: str) -> int:
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO scheduled_posts (channel_id, from_chat_id, message_id, author_id, publish_timestamp, snippet)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (channel_id, from_chat_id, message_id, author_id, publish_timestamp, snippet))
+        INSERT INTO ads_storage (author_id, category, location, description, photos_json, formatted_ad, snippet)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (author_id, category, location, description, json.dumps(photos), formatted_ad, snippet))
+    ad_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return ad_id
+
+def get_ad(ad_id: int):
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, author_id, category, location, description, photos_json, formatted_ad, snippet
+        FROM ads_storage WHERE id = ?
+    """, (ad_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "author_id": row[1],
+        "category": row[2],
+        "location": row[3],
+        "description": row[4],
+        "photos_json": row[5],
+        "formatted_ad": row[6],
+        "snippet": row[7]
+    }
+
+def add_scheduled_post(ad_id: int, publish_timestamp: int, mod_chat_id: int, mod_msg_id: int) -> int:
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO scheduled_posts (ad_id, publish_timestamp, mod_chat_id, mod_msg_id)
+        VALUES (?, ?, ?, ?)
+    """, (ad_id, publish_timestamp, mod_chat_id, mod_msg_id))
     post_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -71,10 +160,18 @@ def add_scheduled_post(channel_id: str, from_chat_id: int, message_id: int, auth
 def get_scheduled_post(post_id: int):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
-    cur.execute("SELECT id, channel_id, from_chat_id, message_id, author_id, publish_timestamp, snippet FROM scheduled_posts WHERE id = ?", (post_id,))
+    cur.execute("SELECT id, ad_id, publish_timestamp, mod_chat_id, mod_msg_id FROM scheduled_posts WHERE id = ?", (post_id,))
     row = cur.fetchone()
     conn.close()
-    return row
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "ad_id": row[1],
+        "publish_timestamp": row[2],
+        "mod_chat_id": row[3],
+        "mod_msg_id": row[4]
+    }
 
 def update_scheduled_time(post_id: int, new_timestamp: int):
     conn = sqlite3.connect("bot_data.db")
@@ -86,7 +183,7 @@ def update_scheduled_time(post_id: int, new_timestamp: int):
 def get_due_posts(current_timestamp: int):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
-    cur.execute("SELECT id, channel_id, from_chat_id, message_id, author_id, snippet FROM scheduled_posts WHERE publish_timestamp <= ?", (current_timestamp,))
+    cur.execute("SELECT id, ad_id, mod_chat_id, mod_msg_id FROM scheduled_posts WHERE publish_timestamp <= ?", (current_timestamp,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -98,7 +195,31 @@ def delete_scheduled_post(post_id: int):
     conn.commit()
     conn.close()
 
-# Функции для связки комментариев
+def save_published_ad(lead_channel_msg_id: int, all_channel_msg_ids: str):
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO published_ads (lead_channel_msg_id, all_channel_msg_ids)
+        VALUES (?, ?)
+    """, (lead_channel_msg_id, all_channel_msg_ids))
+    conn.commit()
+    conn.close()
+
+def get_published_ad_ids(lead_channel_msg_id: int):
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("SELECT all_channel_msg_ids FROM published_ads WHERE lead_channel_msg_id = ?", (lead_channel_msg_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def delete_published_ad(lead_channel_msg_id: int):
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM published_ads WHERE lead_channel_msg_id = ?", (lead_channel_msg_id,))
+    conn.commit()
+    conn.close()
+
 def save_discussion_mapping(channel_msg_id: int, discussion_chat_id: int, discussion_msg_id: int):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
@@ -174,21 +295,21 @@ def get_confirmation_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-def get_initial_mod_keyboard(author_id: int):
+def get_initial_mod_keyboard(ad_id: int):
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Одобрить", callback_data=f"approve_menu:{author_id}")
-    builder.button(text="❌ Отклонить", callback_data=f"no:{author_id}")
+    builder.button(text="✅ Одобрить", callback_data=f"approve_menu:{ad_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"no:{ad_id}")
     builder.adjust(2)
     return builder.as_markup()
 
-def get_schedule_keyboard(author_id: int):
+def get_schedule_keyboard(ad_id: int):
     builder = InlineKeyboardBuilder()
-    builder.button(text="⚡ Сразу", callback_data=f"pub_now:{author_id}")
-    builder.button(text="⏱ +30 мин", callback_data=f"pub_rel:30:{author_id}")
-    builder.button(text="⏳ +1 час", callback_data=f"pub_rel:60:{author_id}")
-    builder.button(text="⏳ +1.5 часа", callback_data=f"pub_rel:90:{author_id}")
-    builder.button(text="✍️ Указать точное время", callback_data=f"pub_exact:{author_id}")
-    builder.button(text="🔙 Назад", callback_data=f"pub_back:{author_id}")
+    builder.button(text="⚡ Сразу", callback_data=f"pub_now:{ad_id}")
+    builder.button(text="⏱ +30 мин", callback_data=f"pub_rel:30:{ad_id}")
+    builder.button(text="⏳ +1 час", callback_data=f"pub_rel:60:{ad_id}")
+    builder.button(text="⏳ +1.5 часа", callback_data=f"pub_rel:90:{ad_id}")
+    builder.button(text="✍️ Указать точное время", callback_data=f"pub_exact:{ad_id}")
+    builder.button(text="🔙 Назад", callback_data=f"pub_back:{ad_id}")
     builder.adjust(2, 2, 1, 1)
     return builder.as_markup()
 
@@ -210,26 +331,57 @@ def get_reschedule_keyboard(post_id: int):
     builder.adjust(2, 2, 1, 1)
     return builder.as_markup()
 
-
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ССЫЛКИ НА АВТОРА ---
-
 def get_author_mention(user: types.User) -> str:
     if user.username:
         return f"@{user.username}"
     return f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
 
 
-# --- ЛОГИКА ПУБЛИКАЦИИ, УДАЛЕНИЯ И ПЛАНИРОВЩИКА ---
+# --- ЛОГИКА ПУБЛИКАЦИИ И ПЛАНИРОВЩИКА ---
 
-async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: int, author_id: int, snippet: str = ""):
-    sent_msg = await bot.copy_message(
-        chat_id=channel_id,
-        from_chat_id=from_chat_id,
-        message_id=message_id
-    )
+async def publish_ad_to_channel(ad_id: int):
+    ad = get_ad(ad_id)
+    if not ad:
+        return
+
+    author_id = ad["author_id"]
+    formatted_ad = ad["formatted_ad"]
+    photos = json.loads(ad["photos_json"])
+    snippet = ad["snippet"]
+
+    channel_msg_ids = []
+
+    if not photos:
+        msg = await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=formatted_ad,
+            parse_mode="HTML"
+        )
+        channel_msg_ids.append(msg.message_id)
+    elif len(photos) == 1:
+        msg = await bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=photos[0],
+            caption=formatted_ad,
+            parse_mode="HTML"
+        )
+        channel_msg_ids.append(msg.message_id)
+    else:
+        media = [types.InputMediaPhoto(media=photos[0], caption=formatted_ad, parse_mode="HTML")]
+        for pid in photos[1:10]:
+            media.append(types.InputMediaPhoto(media=pid))
+        sent_msgs = await bot.send_media_group(
+            chat_id=CHANNEL_ID,
+            media=media
+        )
+        channel_msg_ids = [m.message_id for m in sent_msgs]
+
+    lead_id = channel_msg_ids[0]
+    all_ids_str = ",".join(str(i) for i in channel_msg_ids)
+    save_published_ad(lead_channel_msg_id=lead_id, all_channel_msg_ids=all_ids_str)
 
     del_kb = InlineKeyboardBuilder()
-    del_kb.button(text="🗑 Удалить объявление из канала", callback_data=f"del_pub:{sent_msg.message_id}")
+    del_kb.button(text="🗑 Удалить объявление из канала", callback_data=f"del_pub:{lead_id}")
 
     preview_block = ""
     if snippet:
@@ -243,7 +395,7 @@ async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: 
             "🎉 <b>Ваше объявление опубликовано в канале!</b>\n\n"
             f"{preview_block}"
             "Когда растение заберут или объявление потеряет актуальность, "
-            "нажмите кнопку ниже, чтобы удалить его из канала и обсуждений:",
+            "нажмите кнопку ниже, чтобы удалить его из канала и комментариев:",
             parse_mode="HTML",
             reply_markup=del_kb.as_markup()
         )
@@ -251,7 +403,6 @@ async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: 
         pass
 
 
-# Перехват авто-репоста поста в чат комментариев
 @dp.message(F.is_automatic_forward)
 async def capture_discussion_forward(message: types.Message):
     orig_msg_id = None
@@ -268,30 +419,37 @@ async def capture_discussion_forward(message: types.Message):
         )
 
 
-# Удаление из канала и из комментариев одновременно
 @dp.callback_query(F.data.startswith("del_pub:"))
 async def delete_published_ad_callback(callback: types.CallbackQuery):
-    channel_msg_id = int(callback.data.split(":")[1])
-    deleted_from_channel = False
+    lead_id = int(callback.data.split(":")[1])
+    all_ids_str = get_published_ad_ids(lead_id)
 
-    # 1. Удаляем оригинал из канала
-    try:
-        await bot.delete_message(chat_id=CHANNEL_ID, message_id=channel_msg_id)
-        deleted_from_channel = True
-    except Exception as e:
-        print(f"Не удалось удалить из канала: {e}")
+    if all_ids_str:
+        channel_msg_ids = [int(x) for x in all_ids_str.split(",") if x.strip()]
+    else:
+        channel_msg_ids = [lead_id]
 
-    # 2. Удаляем копию из группы комментариев
-    mapping = get_discussion_mapping(channel_msg_id)
-    if mapping:
-        disc_chat_id, disc_msg_id = mapping
+    deleted_any = False
+
+    for c_id in channel_msg_ids:
         try:
-            await bot.delete_message(chat_id=disc_chat_id, message_id=disc_msg_id)
-        except Exception as e:
-            print(f"Не удалось удалить из чата комментариев: {e}")
-        delete_discussion_mapping(channel_msg_id)
+            await bot.delete_message(chat_id=CHANNEL_ID, message_id=c_id)
+            deleted_any = True
+        except Exception:
+            pass
 
-    if deleted_from_channel:
+        mapping = get_discussion_mapping(c_id)
+        if mapping:
+            disc_chat_id, disc_msg_id = mapping
+            try:
+                await bot.delete_message(chat_id=disc_chat_id, message_id=disc_msg_id)
+            except Exception:
+                pass
+            delete_discussion_mapping(c_id)
+
+    delete_published_ad(lead_id)
+
+    if deleted_any:
         await callback.message.edit_text("✅ Ваше объявление успешно удалено из канала и комментариев.")
         await callback.answer("Объявление удалено!")
     else:
@@ -304,11 +462,12 @@ async def scheduler_worker():
             current_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
             due_posts = get_due_posts(current_ts)
             for row in due_posts:
-                post_id, ch_id, f_chat, msg_id, author_id, snippet = row
+                post_id, ad_id, mod_chat_id, mod_msg_id = row
                 try:
-                    await publish_ad_to_channel(ch_id, f_chat, msg_id, author_id, snippet=snippet or "")
+                    await publish_ad_to_channel(ad_id)
                     try:
-                        await bot.edit_message_reply_markup(chat_id=f_chat, message_id=msg_id, reply_markup=None)
+                        if mod_chat_id and mod_msg_id:
+                            await bot.edit_message_reply_markup(chat_id=mod_chat_id, message_id=mod_msg_id, reply_markup=None)
                     except Exception:
                         pass
                 except Exception as err:
@@ -381,22 +540,30 @@ async def location_chosen(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text.strip())
     await message.answer(
         "Шаг 3 из 3: Отправьте <b>описание объявления</b>.\n\n"
-        "💡 Вы можете прислать текст или <b>фотографию с описанием</b>.",
+        "💡 Вы можете прислать просто текст или <b>от 1 до 10 фотографий</b> (с описанием в подписи к фото).",
         parse_mode="HTML"
     )
     await state.set_state(AdForm.content)
 
 @dp.message(AdForm.content, F.photo | F.text)
-async def content_received(message: types.Message, state: FSMContext):
-    photo_id = None
-    if message.photo:
-        photo_id = message.photo[-1].file_id
+async def content_received(message: types.Message, state: FSMContext, album: list[types.Message] | None = None):
+    photo_ids = []
+    raw_text = ""
+
+    if album:
+        photo_ids = [m.photo[-1].file_id for m in album if m.photo][:10]
+        for m in album:
+            if m.caption:
+                raw_text = m.caption
+                break
+    elif message.photo:
+        photo_ids = [message.photo[-1].file_id]
         raw_text = message.caption or ""
     else:
         raw_text = message.text or ""
 
-    user_description = html.escape(raw_text)
-    await state.update_data(photo_id=photo_id, description=user_description)
+    user_description = html.escape(raw_text) if raw_text else "<i>(без описания)</i>"
+    await state.update_data(photo_ids=photo_ids, description=user_description)
     data = await state.get_data()
 
     author_mention = get_author_mention(message.from_user)
@@ -412,19 +579,28 @@ async def content_received(message: types.Message, state: FSMContext):
         "Если всё верно, нажмите кнопку внизу:"
     )
 
-    if photo_id:
-        await message.answer_photo(
-            photo=photo_id,
-            caption=preview_text,
-            parse_mode="HTML",
-            reply_markup=get_confirmation_keyboard()
-        )
-    else:
+    if not photo_ids:
         await message.answer(
             text=preview_text,
             parse_mode="HTML",
             reply_markup=get_confirmation_keyboard()
         )
+    elif len(photo_ids) == 1:
+        await message.answer_photo(
+            photo=photo_ids[0],
+            caption=preview_text,
+            parse_mode="HTML",
+            reply_markup=get_confirmation_keyboard()
+        )
+    else:
+        media = [types.InputMediaPhoto(media=pid) for pid in photo_ids]
+        await message.answer_media_group(media=media)
+        await message.answer(
+            text=preview_text,
+            parse_mode="HTML",
+            reply_markup=get_confirmation_keyboard()
+        )
+
     await state.set_state(AdForm.confirmation)
 
 @dp.callback_query(AdForm.confirmation, F.data == "confirm_send")
@@ -442,7 +618,7 @@ async def confirm_send_callback(callback: types.CallbackQuery, state: FSMContext
     category = data["category"]
     location = html.escape(data["location"])
     user_description = data["description"]
-    photo_id = data.get("photo_id")
+    photo_ids = data.get("photo_ids", [])
     author_mention = get_author_mention(callback.from_user)
 
     formatted_ad = (
@@ -452,21 +628,44 @@ async def confirm_send_callback(callback: types.CallbackQuery, state: FSMContext
         f"👤 <b>Контакты:</b> {author_mention}"
     )
 
-    mod_kb = get_initial_mod_keyboard(callback.from_user.id)
+    snippet = f"{category}\n📍 {location}\n{user_description}"
+    ad_id = save_ad(
+        author_id=callback.from_user.id,
+        category=category,
+        location=location,
+        description=user_description,
+        photos=photo_ids,
+        formatted_ad=formatted_ad,
+        snippet=snippet
+    )
 
-    if photo_id:
+    mod_kb = get_initial_mod_keyboard(ad_id)
+
+    if not photo_ids:
+        await bot.send_message(
+            chat_id=MODERATION_CHAT_ID,
+            text=formatted_ad,
+            parse_mode="HTML",
+            reply_markup=mod_kb
+        )
+    elif len(photo_ids) == 1:
         await bot.send_photo(
             chat_id=MODERATION_CHAT_ID,
-            photo=photo_id,
+            photo=photo_ids[0],
             caption=formatted_ad,
             parse_mode="HTML",
             reply_markup=mod_kb
         )
     else:
+        media = [types.InputMediaPhoto(media=photo_ids[0], caption=formatted_ad, parse_mode="HTML")]
+        for pid in photo_ids[1:]:
+            media.append(types.InputMediaPhoto(media=pid))
+        album_msgs = await bot.send_media_group(chat_id=MODERATION_CHAT_ID, media=media)
         await bot.send_message(
             chat_id=MODERATION_CHAT_ID,
-            text=formatted_ad,
+            text=f"👆 <b>Объявление с альбомом ({len(photo_ids)} фото) выше.</b>",
             parse_mode="HTML",
+            reply_to_message_id=album_msgs[0].message_id,
             reply_markup=mod_kb
         )
 
@@ -492,50 +691,43 @@ async def fallback_handler(message: types.Message):
 
 @dp.callback_query(F.data.startswith("approve_menu:"))
 async def open_time_menu(callback: types.CallbackQuery):
-    author_id = int(callback.data.split(":")[1])
-    await callback.message.edit_reply_markup(reply_markup=get_schedule_keyboard(author_id))
+    ad_id = int(callback.data.split(":")[1])
+    await callback.message.edit_reply_markup(reply_markup=get_schedule_keyboard(ad_id))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("pub_back:"))
 async def back_to_approval(callback: types.CallbackQuery):
-    author_id = int(callback.data.split(":")[1])
-    await callback.message.edit_reply_markup(reply_markup=get_initial_mod_keyboard(author_id))
+    ad_id = int(callback.data.split(":")[1])
+    await callback.message.edit_reply_markup(reply_markup=get_initial_mod_keyboard(ad_id))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("pub_now:"))
 async def publish_immediately(callback: types.CallbackQuery):
-    author_id = int(callback.data.split(":")[1])
-    snippet = callback.message.caption or callback.message.text or ""
+    ad_id = int(callback.data.split(":")[1])
     await callback.message.edit_reply_markup(reply_markup=None)
-    
-    await publish_ad_to_channel(
-        channel_id=CHANNEL_ID,
-        from_chat_id=callback.message.chat.id,
-        message_id=callback.message.message_id,
-        author_id=author_id,
-        snippet=snippet
-    )
-
+    await publish_ad_to_channel(ad_id)
     await callback.message.reply(f"⚡ Опубликовано сразу модератором {callback.from_user.first_name}")
     await callback.answer("Опубликовано!")
 
 @dp.callback_query(F.data.startswith("pub_rel:"))
 async def schedule_relative(callback: types.CallbackQuery):
-    _, minutes, author_id = callback.data.split(":")
+    _, minutes, ad_id = callback.data.split(":")
     minutes = int(minutes)
-    author_id = int(author_id)
-    snippet = callback.message.caption or callback.message.text or ""
+    ad_id = int(ad_id)
+
+    ad = get_ad(ad_id)
+    if not ad:
+        await callback.answer("⚠️ Объявление не найдено!", show_alert=True)
+        return
 
     target_dt_msk = datetime.datetime.now(MSK) + datetime.timedelta(minutes=minutes)
     target_ts = int(target_dt_msk.astimezone(datetime.timezone.utc).timestamp())
 
     post_id = add_scheduled_post(
-        channel_id=CHANNEL_ID,
-        from_chat_id=callback.message.chat.id,
-        message_id=callback.message.message_id,
-        author_id=author_id,
+        ad_id=ad_id,
         publish_timestamp=target_ts,
-        snippet=snippet
+        mod_chat_id=callback.message.chat.id,
+        mod_msg_id=callback.message.message_id
     )
 
     time_str = target_dt_msk.strftime("%H:%M")
@@ -547,7 +739,7 @@ async def schedule_relative(callback: types.CallbackQuery):
 
     try:
         await bot.send_message(
-            author_id,
+            ad["author_id"],
             f"🎉 Ваше объявление одобрено и будет опубликовано в канале сегодня в <b>{time_str} (МСК)</b>!",
             parse_mode="HTML"
         )
@@ -558,14 +750,12 @@ async def schedule_relative(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pub_exact:"))
 async def prompt_exact_time(callback: types.CallbackQuery, state: FSMContext):
-    author_id = int(callback.data.split(":")[1])
-    snippet = callback.message.caption or callback.message.text or ""
+    ad_id = int(callback.data.split(":")[1])
     await state.set_state(ModSchedule.waiting_for_exact_time)
     await state.update_data(
-        author_id=author_id,
+        ad_id=ad_id,
         target_message_id=callback.message.message_id,
-        mod_chat_id=callback.message.chat.id,
-        snippet=snippet
+        mod_chat_id=callback.message.chat.id
     )
 
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -595,14 +785,14 @@ async def process_exact_time(message: types.Message, state: FSMContext):
 
     target_ts = int(scheduled_dt_msk.astimezone(datetime.timezone.utc).timestamp())
     data = await state.get_data()
+    ad_id = data["ad_id"]
+    ad = get_ad(ad_id)
 
     post_id = add_scheduled_post(
-        channel_id=CHANNEL_ID,
-        from_chat_id=data["mod_chat_id"],
-        message_id=data["target_message_id"],
-        author_id=data["author_id"],
+        ad_id=ad_id,
         publish_timestamp=target_ts,
-        snippet=data.get("snippet", "")
+        mod_chat_id=data["mod_chat_id"],
+        mod_msg_id=data["target_message_id"]
     )
 
     time_str = scheduled_dt_msk.strftime("%H:%M")
@@ -621,14 +811,15 @@ async def process_exact_time(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-    try:
-        await bot.send_message(
-            data["author_id"],
-            f"🎉 Ваше объявление одобрено! Оно будет опубликовано <b>{day_label} в {time_str} (МСК)</b>.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+    if ad:
+        try:
+            await bot.send_message(
+                ad["author_id"],
+                f"🎉 Ваше объявление одобрено! Оно будет опубликовано <b>{day_label} в {time_str} (МСК)</b>.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
     await state.clear()
 
@@ -645,16 +836,18 @@ async def cancel_scheduled_handler(callback: types.CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
         return
 
-    author_id = post[4]
+    ad_id = post["ad_id"]
+    ad = get_ad(ad_id)
     delete_scheduled_post(post_id)
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply(f"🚫 Публикация отменена модератором {callback.from_user.first_name}")
 
-    try:
-        await bot.send_message(author_id, "❌ Публикация вашего объявления была отменена модератором.")
-    except Exception:
-        pass
+    if ad:
+        try:
+            await bot.send_message(ad["author_id"], "❌ Публикация вашего объявления была отменена модератором.")
+        except Exception:
+            pass
 
     await callback.answer("Публикация отменена")
 
@@ -687,11 +880,11 @@ async def reschedule_now_handler(callback: types.CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
         return
 
-    _, ch_id, f_chat, msg_id, author_id, _, snippet = post
+    ad_id = post["ad_id"]
     delete_scheduled_post(post_id)
     await callback.message.edit_reply_markup(reply_markup=None)
 
-    await publish_ad_to_channel(ch_id, f_chat, msg_id, author_id, snippet=snippet or "")
+    await publish_ad_to_channel(ad_id)
     await callback.message.reply(f"⚡ Опубликовано прямо сейчас модератором {callback.from_user.first_name}")
     await callback.answer("Опубликовано!")
 
@@ -707,7 +900,7 @@ async def reschedule_relative_handler(callback: types.CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
         return
 
-    author_id = post[4]
+    ad = get_ad(post["ad_id"])
     new_dt_msk = datetime.datetime.now(MSK) + datetime.timedelta(minutes=minutes)
     new_ts = int(new_dt_msk.astimezone(datetime.timezone.utc).timestamp())
 
@@ -720,14 +913,15 @@ async def reschedule_relative_handler(callback: types.CallbackQuery):
         parse_mode="HTML"
     )
 
-    try:
-        await bot.send_message(
-            author_id,
-            f"ℹ️ Время публикации вашего объявления перенесено на <b>{time_str} (МСК)</b>.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+    if ad:
+        try:
+            await bot.send_message(
+                ad["author_id"],
+                f"ℹ️ Время публикации вашего объявления перенесено на <b>{time_str} (МСК)</b>.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
     await callback.answer("Время изменено!")
 
@@ -778,7 +972,7 @@ async def process_reschedule_exact_time(message: types.Message, state: FSMContex
         await state.clear()
         return
 
-    author_id = post[4]
+    ad = get_ad(post["ad_id"])
     update_scheduled_time(post_id, target_ts)
     time_str = scheduled_dt_msk.strftime("%H:%M")
 
@@ -796,24 +990,27 @@ async def process_reschedule_exact_time(message: types.Message, state: FSMContex
         parse_mode="HTML"
     )
 
-    try:
-        await bot.send_message(
-            author_id,
-            f"ℹ️ Время публикации вашего объявления перенесено на <b>{day_label} в {time_str} (МСК)</b>.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+    if ad:
+        try:
+            await bot.send_message(
+                ad["author_id"],
+                f"ℹ️ Время публикации вашего объявления перенесено на <b>{day_label} в {time_str} (МСК)</b>.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
     await state.clear()
 
 @dp.callback_query(F.data.startswith("no:"))
 async def reject_handler(callback: types.CallbackQuery):
-    author_id = int(callback.data.split(":")[1])
-    try:
-        await bot.send_message(author_id, "❌ Ваше объявление не прошло модерацию.")
-    except Exception:
-        pass
+    ad_id = int(callback.data.split(":")[1])
+    ad = get_ad(ad_id)
+    if ad:
+        try:
+            await bot.send_message(ad["author_id"], "❌ Ваше объявление не прошло модерацию.")
+        except Exception:
+            pass
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply(f"❌ Отклонено ({callback.from_user.first_name})")
@@ -830,7 +1027,7 @@ async def main():
         types.BotCommand(command="start", description="Подать объявление"),
         types.BotCommand(command="cancel", description="Отменить заполнение")
     ])
-    print("Бот запущен с поддержкой двойного удаления (канал + чат комментариев)...")
+    print("Бот успешно запущен с поддержкой альбомов до 10 фото...")
     await dp.start_polling(bot)
 
 
