@@ -21,11 +21,13 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ (ОЧЕРЕДЬ) ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
 
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
+    
+    # Таблица отложенных публикаций
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scheduled_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +43,16 @@ def init_db():
         cur.execute("ALTER TABLE scheduled_posts ADD COLUMN snippet TEXT DEFAULT ''")
     except Exception:
         pass
+
+    # Таблица связки поста в канале с постом в чате комментариев
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS post_comments_map (
+            channel_msg_id INTEGER PRIMARY KEY,
+            discussion_chat_id INTEGER,
+            discussion_msg_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -83,6 +95,32 @@ def delete_scheduled_post(post_id: int):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
     cur.execute("DELETE FROM scheduled_posts WHERE id = ?", (post_id,))
+    conn.commit()
+    conn.close()
+
+# Функции для связки комментариев
+def save_discussion_mapping(channel_msg_id: int, discussion_chat_id: int, discussion_msg_id: int):
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO post_comments_map (channel_msg_id, discussion_chat_id, discussion_msg_id)
+        VALUES (?, ?, ?)
+    """, (channel_msg_id, discussion_chat_id, discussion_msg_id))
+    conn.commit()
+    conn.close()
+
+def get_discussion_mapping(channel_msg_id: int):
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("SELECT discussion_chat_id, discussion_msg_id FROM post_comments_map WHERE channel_msg_id = ?", (channel_msg_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def delete_discussion_mapping(channel_msg_id: int):
+    conn = sqlite3.connect("bot_data.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM post_comments_map WHERE channel_msg_id = ?", (channel_msg_id,))
     conn.commit()
     conn.close()
 
@@ -184,7 +222,6 @@ def get_author_mention(user: types.User) -> str:
 # --- ЛОГИКА ПУБЛИКАЦИИ, УДАЛЕНИЯ И ПЛАНИРОВЩИКА ---
 
 async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: int, author_id: int, snippet: str = ""):
-    # Публикация в канал без инлайн-кнопки (контакты уже внутри текста, а плашка комментариев видна сразу)
     sent_msg = await bot.copy_message(
         chat_id=channel_id,
         from_chat_id=from_chat_id,
@@ -206,7 +243,7 @@ async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: 
             "🎉 <b>Ваше объявление опубликовано в канале!</b>\n\n"
             f"{preview_block}"
             "Когда растение заберут или объявление потеряет актуальность, "
-            "нажмите кнопку ниже, чтобы удалить его из канала:",
+            "нажмите кнопку ниже, чтобы удалить его из канала и обсуждений:",
             parse_mode="HTML",
             reply_markup=del_kb.as_markup()
         )
@@ -214,15 +251,51 @@ async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: 
         pass
 
 
+# Перехват авто-репоста поста в чат комментариев
+@dp.message(F.is_automatic_forward)
+async def capture_discussion_forward(message: types.Message):
+    orig_msg_id = None
+    if getattr(message, "forward_origin", None) and hasattr(message.forward_origin, "message_id"):
+        orig_msg_id = message.forward_origin.message_id
+    elif getattr(message, "forward_from_message_id", None):
+        orig_msg_id = message.forward_from_message_id
+
+    if orig_msg_id:
+        save_discussion_mapping(
+            channel_msg_id=orig_msg_id,
+            discussion_chat_id=message.chat.id,
+            discussion_msg_id=message.message_id
+        )
+
+
+# Удаление из канала и из комментариев одновременно
 @dp.callback_query(F.data.startswith("del_pub:"))
 async def delete_published_ad_callback(callback: types.CallbackQuery):
     channel_msg_id = int(callback.data.split(":")[1])
+    deleted_from_channel = False
+
+    # 1. Удаляем оригинал из канала
     try:
         await bot.delete_message(chat_id=CHANNEL_ID, message_id=channel_msg_id)
-        await callback.message.edit_text("✅ Ваше объявление успешно удалено из канала.")
+        deleted_from_channel = True
+    except Exception as e:
+        print(f"Не удалось удалить из канала: {e}")
+
+    # 2. Удаляем копию из группы комментариев
+    mapping = get_discussion_mapping(channel_msg_id)
+    if mapping:
+        disc_chat_id, disc_msg_id = mapping
+        try:
+            await bot.delete_message(chat_id=disc_chat_id, message_id=disc_msg_id)
+        except Exception as e:
+            print(f"Не удалось удалить из чата комментариев: {e}")
+        delete_discussion_mapping(channel_msg_id)
+
+    if deleted_from_channel:
+        await callback.message.edit_text("✅ Ваше объявление успешно удалено из канала и комментариев.")
         await callback.answer("Объявление удалено!")
-    except Exception:
-        await callback.answer("⚠️ Не удалось удалить объявление (возможно, оно уже было удалено из канала).", show_alert=True)
+    else:
+        await callback.answer("⚠️ Не удалось удалить (возможно, оно уже было удалено).", show_alert=True)
 
 
 async def scheduler_worker():
@@ -757,7 +830,7 @@ async def main():
         types.BotCommand(command="start", description="Подать объявление"),
         types.BotCommand(command="cancel", description="Отменить заполнение")
     ])
-    print("Бот успешно запущен: контакты в посте, комментарии активны...")
+    print("Бот запущен с поддержкой двойного удаления (канал + чат комментариев)...")
     await dp.start_polling(bot)
 
 
