@@ -21,7 +21,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ (ОЧЕРЕДЬ) ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
 
 def init_db():
     conn = sqlite3.connect("bot_data.db")
@@ -33,19 +33,25 @@ def init_db():
             from_chat_id INTEGER,
             message_id INTEGER,
             author_id INTEGER,
-            publish_timestamp INTEGER
+            publish_timestamp INTEGER,
+            snippet TEXT
         )
     """)
+    # Мягкая миграция: добавляем колонку snippet, если база уже существовала
+    try:
+        cur.execute("ALTER TABLE scheduled_posts ADD COLUMN snippet TEXT DEFAULT ''")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
-def add_scheduled_post(channel_id: str, from_chat_id: int, message_id: int, author_id: int, publish_timestamp: int) -> int:
+def add_scheduled_post(channel_id: str, from_chat_id: int, message_id: int, author_id: int, publish_timestamp: int, snippet: str = "") -> int:
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO scheduled_posts (channel_id, from_chat_id, message_id, author_id, publish_timestamp)
-        VALUES (?, ?, ?, ?, ?)
-    """, (channel_id, from_chat_id, message_id, author_id, publish_timestamp))
+        INSERT INTO scheduled_posts (channel_id, from_chat_id, message_id, author_id, publish_timestamp, snippet)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (channel_id, from_chat_id, message_id, author_id, publish_timestamp, snippet))
     post_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -54,7 +60,7 @@ def add_scheduled_post(channel_id: str, from_chat_id: int, message_id: int, auth
 def get_scheduled_post(post_id: int):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
-    cur.execute("SELECT id, channel_id, from_chat_id, message_id, author_id, publish_timestamp FROM scheduled_posts WHERE id = ?", (post_id,))
+    cur.execute("SELECT id, channel_id, from_chat_id, message_id, author_id, publish_timestamp, snippet FROM scheduled_posts WHERE id = ?", (post_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -69,7 +75,7 @@ def update_scheduled_time(post_id: int, new_timestamp: int):
 def get_due_posts(current_timestamp: int):
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
-    cur.execute("SELECT id, channel_id, from_chat_id, message_id, author_id FROM scheduled_posts WHERE publish_timestamp <= ?", (current_timestamp,))
+    cur.execute("SELECT id, channel_id, from_chat_id, message_id, author_id, snippet FROM scheduled_posts WHERE publish_timestamp <= ?", (current_timestamp,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -170,7 +176,7 @@ def get_reschedule_keyboard(post_id: int):
 
 # --- ЛОГИКА ПУБЛИКАЦИИ, УДАЛЕНИЯ И ПЛАНИРОВЩИКА ---
 
-async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: int, author_id: int):
+async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: int, author_id: int, snippet: str = ""):
     try:
         author_chat = await bot.get_chat(author_id)
         author_username = author_chat.username
@@ -191,16 +197,24 @@ async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: 
         reply_markup=post_kb.as_markup()
     )
 
-    # Кнопка самостоятельного удаления для автора
+    # Кнопка удаления для автора
     del_kb = InlineKeyboardBuilder()
     del_kb.button(text="🗑 Удалить объявление из канала", callback_data=f"del_pub:{sent_msg.message_id}")
+
+    # Формируем блок выжимки
+    preview_block = ""
+    if snippet:
+        raw_snippet = snippet.strip()
+        short_snippet = raw_snippet[:180] + "..." if len(raw_snippet) > 180 else raw_snippet
+        preview_block = f"🌿 <b>Объявление:</b>\n<blockquote>{html.escape(short_snippet)}</blockquote>\n\n"
 
     try:
         await bot.send_message(
             author_id,
             "🎉 <b>Ваше объявление опубликовано в канале!</b>\n\n"
-            "Когда растение заберут или объявление станет неактуальным, "
-            "нажмите кнопку ниже, чтобы удалить пост из канала:",
+            f"{preview_block}"
+            "Когда растение заберут или объявление потеряет актуальность, "
+            "нажмите кнопку ниже, чтобы удалить его из канала:",
             parse_mode="HTML",
             reply_markup=del_kb.as_markup()
         )
@@ -225,9 +239,9 @@ async def scheduler_worker():
             current_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
             due_posts = get_due_posts(current_ts)
             for row in due_posts:
-                post_id, ch_id, f_chat, msg_id, author_id = row
+                post_id, ch_id, f_chat, msg_id, author_id, snippet = row
                 try:
-                    await publish_ad_to_channel(ch_id, f_chat, msg_id, author_id)
+                    await publish_ad_to_channel(ch_id, f_chat, msg_id, author_id, snippet=snippet or "")
                     try:
                         await bot.edit_message_reply_markup(chat_id=f_chat, message_id=msg_id, reply_markup=None)
                     except Exception:
@@ -421,13 +435,15 @@ async def back_to_approval(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("pub_now:"))
 async def publish_immediately(callback: types.CallbackQuery):
     author_id = int(callback.data.split(":")[1])
+    snippet = callback.message.caption or callback.message.text or ""
     await callback.message.edit_reply_markup(reply_markup=None)
     
     await publish_ad_to_channel(
         channel_id=CHANNEL_ID,
         from_chat_id=callback.message.chat.id,
         message_id=callback.message.message_id,
-        author_id=author_id
+        author_id=author_id,
+        snippet=snippet
     )
 
     await callback.message.reply(f"⚡ Опубликовано сразу модератором {callback.from_user.first_name}")
@@ -438,6 +454,7 @@ async def schedule_relative(callback: types.CallbackQuery):
     _, minutes, author_id = callback.data.split(":")
     minutes = int(minutes)
     author_id = int(author_id)
+    snippet = callback.message.caption or callback.message.text or ""
 
     target_dt_msk = datetime.datetime.now(MSK) + datetime.timedelta(minutes=minutes)
     target_ts = int(target_dt_msk.astimezone(datetime.timezone.utc).timestamp())
@@ -447,7 +464,8 @@ async def schedule_relative(callback: types.CallbackQuery):
         from_chat_id=callback.message.chat.id,
         message_id=callback.message.message_id,
         author_id=author_id,
-        publish_timestamp=target_ts
+        publish_timestamp=target_ts,
+        snippet=snippet
     )
 
     time_str = target_dt_msk.strftime("%H:%M")
@@ -471,11 +489,13 @@ async def schedule_relative(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("pub_exact:"))
 async def prompt_exact_time(callback: types.CallbackQuery, state: FSMContext):
     author_id = int(callback.data.split(":")[1])
+    snippet = callback.message.caption or callback.message.text or ""
     await state.set_state(ModSchedule.waiting_for_exact_time)
     await state.update_data(
         author_id=author_id,
         target_message_id=callback.message.message_id,
-        mod_chat_id=callback.message.chat.id
+        mod_chat_id=callback.message.chat.id,
+        snippet=snippet
     )
 
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -511,7 +531,8 @@ async def process_exact_time(message: types.Message, state: FSMContext):
         from_chat_id=data["mod_chat_id"],
         message_id=data["target_message_id"],
         author_id=data["author_id"],
-        publish_timestamp=target_ts
+        publish_timestamp=target_ts,
+        snippet=data.get("snippet", "")
     )
 
     time_str = scheduled_dt_msk.strftime("%H:%M")
@@ -596,11 +617,11 @@ async def reschedule_now_handler(callback: types.CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
         return
 
-    _, ch_id, f_chat, msg_id, author_id, _ = post
+    _, ch_id, f_chat, msg_id, author_id, _, snippet = post
     delete_scheduled_post(post_id)
     await callback.message.edit_reply_markup(reply_markup=None)
 
-    await publish_ad_to_channel(ch_id, f_chat, msg_id, author_id)
+    await publish_ad_to_channel(ch_id, f_chat, msg_id, author_id, snippet=snippet or "")
     await callback.message.reply(f"⚡ Опубликовано прямо сейчас модератором {callback.from_user.first_name}")
     await callback.answer("Опубликовано!")
 
@@ -739,7 +760,7 @@ async def main():
         types.BotCommand(command="start", description="Подать объявление"),
         types.BotCommand(command="cancel", description="Отменить заполнение")
     ])
-    print("Бот успешно запущен с поддержкой очередей и удаления...")
+    print("Бот успешно запущен с поддержкой очередей, удаления и предпросмотра...")
     await dp.start_polling(bot)
 
 
