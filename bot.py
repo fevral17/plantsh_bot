@@ -21,7 +21,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ (ОЧЕРЕДЬ) ---
 
 def init_db():
     conn = sqlite3.connect("bot_data.db")
@@ -149,7 +149,6 @@ def get_schedule_keyboard(author_id: int):
     builder.adjust(2, 2, 1, 1)
     return builder.as_markup()
 
-# Кнопки под уже запланированным постом
 def get_manage_scheduled_keyboard(post_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="⏱ Перенести время", callback_data=f"resched_menu:{post_id}")
@@ -157,7 +156,6 @@ def get_manage_scheduled_keyboard(post_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
-# Кнопки для выбора нового времени
 def get_reschedule_keyboard(post_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="⚡ Опубликовать сейчас", callback_data=f"resched_now:{post_id}")
@@ -170,7 +168,7 @@ def get_reschedule_keyboard(post_id: int):
     return builder.as_markup()
 
 
-# --- ЛОГИКА ПУБЛИКАЦИИ И ПЛАНИРОВЩИКА ---
+# --- ЛОГИКА ПУБЛИКАЦИИ, УДАЛЕНИЯ И ПЛАНИРОВЩИКА ---
 
 async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: int, author_id: int):
     try:
@@ -185,17 +183,40 @@ async def publish_ad_to_channel(channel_id: str, from_chat_id: int, message_id: 
     else:
         post_kb.button(text="💬 Написать автору", url=f"tg://openmessage?user_id={author_id}")
 
-    await bot.copy_message(
+    # Публикация в канал
+    sent_msg = await bot.copy_message(
         chat_id=channel_id,
         from_chat_id=from_chat_id,
         message_id=message_id,
         reply_markup=post_kb.as_markup()
     )
 
+    # Кнопка самостоятельного удаления для автора
+    del_kb = InlineKeyboardBuilder()
+    del_kb.button(text="🗑 Удалить объявление из канала", callback_data=f"del_pub:{sent_msg.message_id}")
+
     try:
-        await bot.send_message(author_id, "🎉 Ваше объявление опубликовано в канале!")
+        await bot.send_message(
+            author_id,
+            "🎉 <b>Ваше объявление опубликовано в канале!</b>\n\n"
+            "Когда растение заберут или объявление станет неактуальным, "
+            "нажмите кнопку ниже, чтобы удалить пост из канала:",
+            parse_mode="HTML",
+            reply_markup=del_kb.as_markup()
+        )
     except Exception:
         pass
+
+
+@dp.callback_query(F.data.startswith("del_pub:"))
+async def delete_published_ad_callback(callback: types.CallbackQuery):
+    channel_msg_id = int(callback.data.split(":")[1])
+    try:
+        await bot.delete_message(chat_id=CHANNEL_ID, message_id=channel_msg_id)
+        await callback.message.edit_text("✅ Ваше объявление успешно удалено из канала.")
+        await callback.answer("Объявление удалено!")
+    except Exception:
+        await callback.answer("⚠️ Не удалось удалить объявление (возможно, оно уже было удалено из канала).", show_alert=True)
 
 
 async def scheduler_worker():
@@ -207,7 +228,6 @@ async def scheduler_worker():
                 post_id, ch_id, f_chat, msg_id, author_id = row
                 try:
                     await publish_ad_to_channel(ch_id, f_chat, msg_id, author_id)
-                    # Очищаем кнопки управления в модераторском чате после публикации
                     try:
                         await bot.edit_message_reply_markup(chat_id=f_chat, message_id=msg_id, reply_markup=None)
                     except Exception:
@@ -431,7 +451,6 @@ async def schedule_relative(callback: types.CallbackQuery):
     )
 
     time_str = target_dt_msk.strftime("%H:%M")
-    # Меняем кнопки на управление запланированным постом
     await callback.message.edit_reply_markup(reply_markup=get_manage_scheduled_keyboard(post_id))
     await callback.message.reply(
         f"⏳ Одобрено! Запланировано на <b>{time_str} (МСК)</b> модератором {callback.from_user.first_name}",
@@ -497,7 +516,6 @@ async def process_exact_time(message: types.Message, state: FSMContext):
 
     time_str = scheduled_dt_msk.strftime("%H:%M")
     
-    # Добавляем кнопки управления под оригинальный пост
     try:
         await bot.edit_message_reply_markup(
             chat_id=data["mod_chat_id"],
@@ -524,9 +542,8 @@ async def process_exact_time(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# --- ПАНЕЛЬ МОДЕРАЦИИ: УПРАВЛЕНИЕ ОЧЕРЕДЬЮ (ОТМЕНА И ПЕРЕНОС) ---
+# --- ПАНЕЛЬ МОДЕРАЦИИ: ПЕРЕНОС И ОТМЕНА ОЧЕРЕДИ ---
 
-# Кнопка «Отменить публикацию»
 @dp.callback_query(F.data.startswith("cancel_sched:"))
 async def cancel_scheduled_handler(callback: types.CallbackQuery):
     post_id = int(callback.data.split(":")[1])
@@ -550,7 +567,6 @@ async def cancel_scheduled_handler(callback: types.CallbackQuery):
 
     await callback.answer("Публикация отменена")
 
-# Открытие меню переноса времени
 @dp.callback_query(F.data.startswith("resched_menu:"))
 async def reschedule_menu_handler(callback: types.CallbackQuery):
     post_id = int(callback.data.split(":")[1])
@@ -564,14 +580,12 @@ async def reschedule_menu_handler(callback: types.CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=get_reschedule_keyboard(post_id))
     await callback.answer()
 
-# Кнопка «Назад» в меню переноса времени
 @dp.callback_query(F.data.startswith("resched_back:"))
 async def reschedule_back_handler(callback: types.CallbackQuery):
     post_id = int(callback.data.split(":")[1])
     await callback.message.edit_reply_markup(reply_markup=get_manage_scheduled_keyboard(post_id))
     await callback.answer()
 
-# Опубликовать сейчас из меню переноса
 @dp.callback_query(F.data.startswith("resched_now:"))
 async def reschedule_now_handler(callback: types.CallbackQuery):
     post_id = int(callback.data.split(":")[1])
@@ -590,7 +604,6 @@ async def reschedule_now_handler(callback: types.CallbackQuery):
     await callback.message.reply(f"⚡ Опубликовано прямо сейчас модератором {callback.from_user.first_name}")
     await callback.answer("Опубликовано!")
 
-# Относительный перенос (+30 мин, +1 час, +1.5 часа)
 @dp.callback_query(F.data.startswith("resched_rel:"))
 async def reschedule_relative_handler(callback: types.CallbackQuery):
     _, minutes, post_id = callback.data.split(":")
@@ -627,7 +640,6 @@ async def reschedule_relative_handler(callback: types.CallbackQuery):
 
     await callback.answer("Время изменено!")
 
-# Запрос точного времени при переносе
 @dp.callback_query(F.data.startswith("resched_exact:"))
 async def reschedule_prompt_exact_handler(callback: types.CallbackQuery, state: FSMContext):
     post_id = int(callback.data.split(":")[1])
@@ -679,7 +691,6 @@ async def process_reschedule_exact_time(message: types.Message, state: FSMContex
     update_scheduled_time(post_id, target_ts)
     time_str = scheduled_dt_msk.strftime("%H:%M")
 
-    # Возвращаем клавиатуру управления под оригинальное сообщение
     try:
         await bot.edit_message_reply_markup(
             chat_id=message.chat.id,
@@ -705,7 +716,6 @@ async def process_reschedule_exact_time(message: types.Message, state: FSMContex
 
     await state.clear()
 
-# Кнопка «Отклонить» при первичной модерации
 @dp.callback_query(F.data.startswith("no:"))
 async def reject_handler(callback: types.CallbackQuery):
     author_id = int(callback.data.split(":")[1])
@@ -729,7 +739,7 @@ async def main():
         types.BotCommand(command="start", description="Подать объявление"),
         types.BotCommand(command="cancel", description="Отменить заполнение")
     ])
-    print("Бот успешно запущен с поддержкой управления очередью...")
+    print("Бот успешно запущен с поддержкой очередей и удаления...")
     await dp.start_polling(bot)
 
 
