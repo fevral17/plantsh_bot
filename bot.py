@@ -279,8 +279,8 @@ def get_subscribe_keyboard():
 
 def get_category_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="🎁 Отдам даром", callback_data="cat:#отдам_даром")
-    builder.button(text="🙏 Приму в дар", callback_data="cat:#приму_в_дар")
+    builder.button(text="🎁 Отдам даром", callback_data="cat:#отдам_даром_плантшеринг_мск")
+    builder.button(text="🙏 Приму в дар", callback_data="cat:#приму_в_дар_плантшеринг_мск")
     builder.adjust(2)
     return builder.as_markup()
 
