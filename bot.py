@@ -7,6 +7,7 @@ import re
 import sqlite3
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -259,7 +260,7 @@ class ModSchedule(StatesGroup):
     waiting_for_reschedule_time = State()
 
 
-# --- КЛАВИАТУРЫ ---
+# --- КЛАВИАТУРЫ И ССЫЛКИ ---
 
 async def check_subscription(user_id: int) -> bool:
     try:
@@ -335,6 +336,12 @@ def get_author_mention(user: types.User) -> str:
     if user.username:
         return f"@{user.username}"
     return f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
+
+def get_channel_post_url(message_id: int) -> str:
+    if CHANNEL_ID.startswith("@"):
+        return f"https://t.me/{CHANNEL_ID.lstrip('@')}/{message_id}"
+    clean_id = CHANNEL_ID.replace("-100", "").replace("-", "")
+    return f"https://t.me/c/{clean_id}/{message_id}"
 
 
 # --- ЛОГИКА ПУБЛИКАЦИИ И ПЛАНИРОВЩИКА ---
@@ -432,11 +439,19 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
         snippet = ""
 
     deleted_any = False
+    is_too_old = False
+    already_not_found = False
 
     for c_id in channel_msg_ids:
         try:
             await bot.delete_message(chat_id=CHANNEL_ID, message_id=c_id)
             deleted_any = True
+        except TelegramBadRequest as err:
+            err_text = str(err).lower()
+            if "can't be deleted" in err_text or "cant be deleted" in err_text:
+                is_too_old = True
+            elif "not found" in err_text:
+                already_not_found = True
         except Exception:
             pass
 
@@ -449,22 +464,63 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
                 pass
             delete_discussion_mapping(c_id)
 
-    delete_published_ad(lead_id)
+    quote_block = ""
+    if snippet:
+        raw_snippet = snippet.strip()
+        short_snippet = raw_snippet[:180] + "..." if len(raw_snippet) > 180 else raw_snippet
+        quote_block = f"\n\n🌿 <b>Объявление:</b>\n<blockquote>{html.escape(short_snippet)}</blockquote>"
 
+    # Случай 1: Пост старше 48 часов — эскалируем модераторам
+    if is_too_old and not deleted_any:
+        post_url = get_channel_post_url(lead_id)
+        author_mention = get_author_mention(callback.from_user)
+
+        mod_alert = (
+            "⚠️ <b>Запрос на ручное удаление (пост старше 48 часов)</b>\n\n"
+            f"👤 <b>Автор:</b> {author_mention}\n"
+            f"🔗 <b>Ссылка на пост:</b> <a href=\"{post_url}\">Перейти к публикации</a>"
+            f"{quote_block}\n\n"
+            "<i>Telegram не разрешает боту автоматически удалять записи старше двух суток. Пожалуйста, удалите пост и ветку обсуждения вручную.</i>"
+        )
+
+        try:
+            await bot.send_message(
+                chat_id=MODERATION_CHAT_ID,
+                text=mod_alert,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"Ошибка отправки запроса модераторам: {e}")
+
+        delete_published_ad(lead_id)
+
+        await callback.message.edit_text(
+            "⏳ <b>Объявление опубликовано более 48 часов назад.</b>\n\n"
+            "По правилам Telegram бот не может снять его автоматически. "
+            "Запрос передан модераторам — они удалят пост из канала вручную в ближайшее время."
+            f"{quote_block}",
+            parse_mode="HTML"
+        )
+        await callback.answer("Запрос передан модераторам")
+        return
+
+    # Случай 2: Успешно удалено
     if deleted_any:
-        quote_block = ""
-        if snippet:
-            raw_snippet = snippet.strip()
-            short_snippet = raw_snippet[:180] + "..." if len(raw_snippet) > 180 else raw_snippet
-            quote_block = f"\n\n🌿 <b>Удалённое объявление:</b>\n<blockquote>{html.escape(short_snippet)}</blockquote>"
-
+        delete_published_ad(lead_id)
         await callback.message.edit_text(
             f"✅ Ваше объявление успешно удалено из канала и комментариев.{quote_block}",
             parse_mode="HTML"
         )
         await callback.answer("Объявление удалено!")
-    else:
-        await callback.answer("⚠️ Не удалось удалить (возможно, оно уже было удалено).", show_alert=True)
+        return
+
+    # Случай 3: Пост уже удалили ранее
+    delete_published_ad(lead_id)
+    await callback.message.edit_text(
+        f"ℹ️ Ваше объявление уже было удалено из канала ранее.{quote_block}",
+        parse_mode="HTML"
+    )
+    await callback.answer("Уже удалено")
 
 
 async def scheduler_worker():
@@ -556,7 +612,6 @@ async def location_chosen(message: types.Message, state: FSMContext):
     )
     await state.set_state(AdForm.content)
 
-# Корректный ввод фото или текста
 @dp.message(AdForm.content, F.photo | F.text)
 async def content_received(message: types.Message, state: FSMContext, album: list[types.Message] | None = None):
     photo_ids = []
@@ -615,7 +670,6 @@ async def content_received(message: types.Message, state: FSMContext, album: lis
 
     await state.set_state(AdForm.confirmation)
 
-# Перехват видео, файлов, стикеров и других неподдерживаемых форматов
 @dp.message(AdForm.content)
 async def unsupported_media_received(message: types.Message):
     await message.reply(
@@ -630,7 +684,7 @@ async def confirm_send_callback(callback: types.CallbackQuery, state: FSMContext
     if not await check_subscription(callback.from_user.id):
         await state.clear()
         await callback.message.answer(
-            "⚠️️ Вы не подписаны на канал. Подпишитесь, чтобы отправить объявление:",
+            "⚠️ Вы не подписаны на канал. Подпишитесь, чтобы отправить объявление:",
             reply_markup=get_subscribe_keyboard()
         )
         await callback.answer()
@@ -782,7 +836,7 @@ async def prompt_exact_time(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply(
-        "✍️ Отправьте время публикации в формате <b>ЧЧ:ММ</b> по МСК (например, <code>18:30</code>):",
+        "✍️️ Отправьте время публикации в формате <b>ЧЧ:ММ</b> по МСК (например, <code>18:30</code>):",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -918,7 +972,7 @@ async def reschedule_relative_handler(callback: types.CallbackQuery):
 
     post = get_scheduled_post(post_id)
     if not post:
-        await callback.answer("⚠️️ Этот пост уже опубликован или отменён!", show_alert=True)
+        await callback.answer("⚠️ Этот пост уже опубликован или отменён!", show_alert=True)
         await callback.message.edit_reply_markup(reply_markup=None)
         return
 
