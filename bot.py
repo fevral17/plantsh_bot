@@ -254,6 +254,9 @@ class AdForm(StatesGroup):
     location = State()
     content = State()
     confirmation = State()
+    edit_location = State()
+    edit_text_only = State()
+    edit_photos = State()
 
 class ModSchedule(StatesGroup):
     waiting_for_exact_time = State()
@@ -292,8 +295,19 @@ def get_new_ad_keyboard():
 def get_confirmation_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🚀 Отправить на модерацию", callback_data="confirm_send")
-    builder.button(text="🔄 Заполнить заново", callback_data="restart_ad")
+    builder.button(text="✏️ Изменить черновик", callback_data="edit_draft_menu")
+    builder.button(text="❌ Отменить объявление", callback_data="restart_ad")
     builder.adjust(1)
+    return builder.as_markup()
+
+def get_edit_menu_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🏷 Категорию", callback_data="edit_field:category")
+    builder.button(text="📍 Метро / Район", callback_data="edit_field:location")
+    builder.button(text="📝 Только текст (фото останутся)", callback_data="edit_field:text")
+    builder.button(text="📷 Фотографии", callback_data="edit_field:photos")
+    builder.button(text="🔙 Назад к предпросмотру", callback_data="edit_field:back")
+    builder.adjust(2, 1, 1, 1)
     return builder.as_markup()
 
 def get_initial_mod_keyboard(ad_id: int):
@@ -342,6 +356,58 @@ def get_channel_post_url(message_id: int) -> str:
         return f"https://t.me/{CHANNEL_ID.lstrip('@')}/{message_id}"
     clean_id = CHANNEL_ID.replace("-100", "").replace("-", "")
     return f"https://t.me/c/{clean_id}/{message_id}"
+
+
+# --- ГЕНЕРАЦИЯ ПРЕДПРОСМОТРА ОБЪЯВЛЕНИЯ ---
+
+async def send_ad_preview(target: types.Message | types.CallbackQuery, state: FSMContext, user: types.User):
+    data = await state.get_data()
+    author_mention = get_author_mention(user)
+
+    category = data.get("category", "")
+    location = html.escape(data.get("location", "Не указано"))
+    user_description = data.get("description", "<i>(без описания)</i>")
+    photo_ids = data.get("photo_ids", [])
+
+    preview_text = (
+        "👀 <b>Проверьте ваше объявление перед отправкой:</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"{category}\n\n"
+        f"📍 <b>Метро / Район:</b> {location}\n\n"
+        f"{user_description}\n\n"
+        f"👤 <b>Контакты:</b> {author_mention}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Если всё верно, нажмите кнопку внизу:"
+    )
+
+    chat_id = target.chat.id if isinstance(target, types.Message) else target.message.chat.id
+
+    if not photo_ids:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=preview_text,
+            parse_mode="HTML",
+            reply_markup=get_confirmation_keyboard()
+        )
+    elif len(photo_ids) == 1:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=photo_ids[0],
+            caption=preview_text,
+            parse_mode="HTML",
+            reply_markup=get_confirmation_keyboard()
+        )
+    else:
+        media = [types.InputMediaPhoto(media=pid) for pid in photo_ids]
+        await bot.send_media_group(chat_id=chat_id, media=media)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=preview_text,
+            parse_mode="HTML",
+            reply_markup=get_confirmation_keyboard()
+        )
+
+    await state.set_state(AdForm.confirmation)
 
 
 # --- ЛОГИКА ПУБЛИКАЦИИ И ПЛАНИРОВЩИКА ---
@@ -440,7 +506,6 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
 
     deleted_any = False
     is_too_old = False
-    already_not_found = False
 
     for c_id in channel_msg_ids:
         try:
@@ -450,8 +515,6 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
             err_text = str(err).lower()
             if "can't be deleted" in err_text or "cant be deleted" in err_text:
                 is_too_old = True
-            elif "not found" in err_text:
-                already_not_found = True
         except Exception:
             pass
 
@@ -470,7 +533,6 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
         short_snippet = raw_snippet[:180] + "..." if len(raw_snippet) > 180 else raw_snippet
         quote_block = f"\n\n🌿 <b>Объявление:</b>\n<blockquote>{html.escape(short_snippet)}</blockquote>"
 
-    # Случай 1: Пост старше 48 часов — эскалируем модераторам
     if is_too_old and not deleted_any:
         post_url = get_channel_post_url(lead_id)
         author_mention = get_author_mention(callback.from_user)
@@ -504,7 +566,6 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
         await callback.answer("Запрос передан модераторам")
         return
 
-    # Случай 2: Успешно удалено
     if deleted_any:
         delete_published_ad(lead_id)
         await callback.message.edit_text(
@@ -514,7 +575,6 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
         await callback.answer("Объявление удалено!")
         return
 
-    # Случай 3: Пост уже удалили ранее
     delete_published_ad(lead_id)
     await callback.message.edit_text(
         f"ℹ️ Ваше объявление уже было удалено из канала ранее.{quote_block}",
@@ -545,7 +605,7 @@ async def scheduler_worker():
         await asyncio.sleep(15)
 
 
-# --- ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ (АНКЕТА) ---
+# --- ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ (АНКЕТА И РЕДАКТИРОВАНИЕ) ---
 
 async def start_ad_creation(target: types.Message | types.CallbackQuery, state: FSMContext):
     text = (
@@ -564,7 +624,7 @@ async def start_handler(message: types.Message, state: FSMContext):
     is_subscribed = await check_subscription(message.from_user.id)
     if not is_subscribed:
         await message.answer(
-            "⚠️ Подача объявлений доступна <b>только подписчикам</b> нашего канала.\n\n"
+            "⚠️️ Подача объявлений доступна <b>только подписчикам</b> нашего канала.\n\n"
             "Пожалуйста, подпишитесь и нажмите кнопку <b>«Я подписался»</b>:",
             parse_mode="HTML",
             reply_markup=get_subscribe_keyboard()
@@ -594,12 +654,26 @@ async def cancel_handler(message: types.Message, state: FSMContext):
 async def category_chosen(callback: types.CallbackQuery, state: FSMContext):
     category_tag = callback.data.split(":")[1]
     await state.update_data(category=category_tag)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        f"Выбрано: <b>{category_tag}</b>\n\nШаг 2 из 3: Укажите вашу <b>станцию метро или район</b>:",
-        parse_mode="HTML"
-    )
-    await state.set_state(AdForm.location)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    data = await state.get_data()
+    # Если объявление уже заполнялось ранее (редактирование категории)
+    if "location" in data and ("description" in data or "photo_ids" in data):
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await send_ad_preview(callback, state, callback.from_user)
+    else:
+        await callback.message.answer(
+            f"Выбрано: <b>{category_tag}</b>\n\nШаг 2 из 3: Укажите вашу <b>станцию метро или район</b>:",
+            parse_mode="HTML"
+        )
+        await state.set_state(AdForm.location)
+
     await callback.answer()
 
 @dp.message(AdForm.location, F.text)
@@ -631,44 +705,7 @@ async def content_received(message: types.Message, state: FSMContext, album: lis
 
     user_description = html.escape(raw_text) if raw_text else "<i>(без описания)</i>"
     await state.update_data(photo_ids=photo_ids, description=user_description)
-    data = await state.get_data()
-
-    author_mention = get_author_mention(message.from_user)
-
-    preview_text = (
-        "👀 <b>Проверьте ваше объявление перед отправкой:</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"{data['category']}\n\n"
-        f"📍 <b>Метро / Район:</b> {html.escape(data['location'])}\n\n"
-        f"{user_description}\n\n"
-        f"👤 <b>Контакты:</b> {author_mention}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Если всё верно, нажмите кнопку внизу:"
-    )
-
-    if not photo_ids:
-        await message.answer(
-            text=preview_text,
-            parse_mode="HTML",
-            reply_markup=get_confirmation_keyboard()
-        )
-    elif len(photo_ids) == 1:
-        await message.answer_photo(
-            photo=photo_ids[0],
-            caption=preview_text,
-            parse_mode="HTML",
-            reply_markup=get_confirmation_keyboard()
-        )
-    else:
-        media = [types.InputMediaPhoto(media=pid) for pid in photo_ids]
-        await message.answer_media_group(media=media)
-        await message.answer(
-            text=preview_text,
-            parse_mode="HTML",
-            reply_markup=get_confirmation_keyboard()
-        )
-
-    await state.set_state(AdForm.confirmation)
+    await send_ad_preview(message, state, message.from_user)
 
 @dp.message(AdForm.content)
 async def unsupported_media_received(message: types.Message):
@@ -678,6 +715,73 @@ async def unsupported_media_received(message: types.Message):
         "или просто <b>текстовое сообщение</b>.",
         parse_mode="HTML"
     )
+
+
+# --- МЕНЮ РЕДАКТИРОВАНИЯ ЧЕРНОВИКА ---
+
+@dp.callback_query(AdForm.confirmation, F.data == "edit_draft_menu")
+async def open_edit_menu(callback: types.CallbackQuery):
+    await callback.message.reply(
+        "🛠 <b>Что именно вы хотите изменить в объявлении?</b>",
+        parse_mode="HTML",
+        reply_markup=get_edit_menu_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_field:"))
+async def handle_edit_choice(callback: types.CallbackQuery, state: FSMContext):
+    field = callback.data.split(":")[1]
+
+    if field == "category":
+        await callback.message.edit_text("Выберите новую категорию:", reply_markup=get_category_keyboard())
+        await state.set_state(AdForm.category)
+    elif field == "location":
+        await callback.message.edit_text("📍 Введите новую станцию метро или район:")
+        await state.set_state(AdForm.edit_location)
+    elif field == "text":
+        await callback.message.edit_text("📝 Отправьте новый текст объявления (все фотографии останутся прежними):")
+        await state.set_state(AdForm.edit_text_only)
+    elif field == "photos":
+        await callback.message.edit_text("📷 Отправьте новые фотографии растения (от 1 до 10 шт.):")
+        await state.set_state(AdForm.edit_photos)
+    elif field == "back":
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await send_ad_preview(callback, state, callback.from_user)
+
+    await callback.answer()
+
+@dp.message(AdForm.edit_location, F.text)
+async def process_edit_location(message: types.Message, state: FSMContext):
+    await state.update_data(location=message.text.strip())
+    await send_ad_preview(message, state, message.from_user)
+
+@dp.message(AdForm.edit_text_only, F.text)
+async def process_edit_text(message: types.Message, state: FSMContext):
+    await state.update_data(description=html.escape(message.text.strip()))
+    await send_ad_preview(message, state, message.from_user)
+
+@dp.message(AdForm.edit_photos, F.photo)
+async def process_edit_photos(message: types.Message, state: FSMContext, album: list[types.Message] | None = None):
+    if album:
+        photo_ids = [m.photo[-1].file_id for m in album if m.photo][:10]
+        for m in album:
+            if m.caption:
+                await state.update_data(description=html.escape(m.caption))
+                break
+    else:
+        photo_ids = [message.photo[-1].file_id]
+        if message.caption:
+            await state.update_data(description=html.escape(message.caption))
+
+    await state.update_data(photo_ids=photo_ids)
+    await send_ad_preview(message, state, message.from_user)
+
+@dp.message(AdForm.edit_photos)
+async def invalid_edit_photos(message: types.Message):
+    await message.reply("⚠️ Пожалуйста, отправьте <b>фотографии</b> растения (до 10 шт.).", parse_mode="HTML")
 
 @dp.callback_query(AdForm.confirmation, F.data == "confirm_send")
 async def confirm_send_callback(callback: types.CallbackQuery, state: FSMContext):
@@ -836,7 +940,7 @@ async def prompt_exact_time(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply(
-        "✍️️ Отправьте время публикации в формате <b>ЧЧ:ММ</b> по МСК (например, <code>18:30</code>):",
+        "✍️ Отправьте время публикации в формате <b>ЧЧ:ММ</b> по МСК (например, <code>18:30</code>):",
         parse_mode="HTML"
     )
     await callback.answer()
