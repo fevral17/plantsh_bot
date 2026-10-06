@@ -36,7 +36,6 @@ class AlbumMiddleware(BaseMiddleware):
         event: types.Message,
         data: Dict[str, Any]
     ) -> Any:
-        # Альбомы группируем только в личных сообщениях с ботом
         if event.chat.type != "private" or not event.media_group_id:
             data["album"] = None
             return await handler(event, data)
@@ -61,7 +60,6 @@ def init_db():
     conn = sqlite3.connect("bot_data.db")
     cur = conn.cursor()
 
-    # Хранилище созданных анкет объявлений
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ads_storage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +73,6 @@ def init_db():
         )
     """)
 
-    # Таблица отложенной очереди постов
     cur.execute("PRAGMA table_info(scheduled_posts)")
     cols = [r[1] for r in cur.fetchall()]
     if cols and "ad_id" not in cols:
@@ -91,12 +88,11 @@ def init_db():
         )
     """)
 
-    # Хранилище опубликованных постов (для чистого удаления альбомов и отображения цитаты)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS published_ads (
             lead_channel_msg_id INTEGER PRIMARY KEY,
             all_channel_msg_ids TEXT,
-            snippet TEXT DEFAULT ''
+            snippet TEXT
         )
     """)
     try:
@@ -104,7 +100,6 @@ def init_db():
     except Exception:
         pass
 
-    # Связка поста в канале с постом в чате комментариев
     cur.execute("""
         CREATE TABLE IF NOT EXISTS post_comments_map (
             channel_msg_id INTEGER PRIMARY KEY,
@@ -216,12 +211,7 @@ def get_published_ad(lead_channel_msg_id: int):
     cur.execute("SELECT all_channel_msg_ids, snippet FROM published_ads WHERE lead_channel_msg_id = ?", (lead_channel_msg_id,))
     row = cur.fetchone()
     conn.close()
-    if not row:
-        return None
-    return {
-        "all_channel_msg_ids": row[0],
-        "snippet": row[1]
-    }
+    return row
 
 def delete_published_ad(lead_channel_msg_id: int):
     conn = sqlite3.connect("bot_data.db")
@@ -256,7 +246,7 @@ def delete_discussion_mapping(channel_msg_id: int):
     conn.close()
 
 
-# --- FSM (СОСТОЯНИЯ АНКЕТЫ И ПЛАНИРОВЩИКА) ---
+# --- FSM (СОСТОЯНИЯ) ---
 
 class AdForm(StatesGroup):
     category = State()
@@ -269,7 +259,7 @@ class ModSchedule(StatesGroup):
     waiting_for_reschedule_time = State()
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И КЛАВИАТУРЫ ---
+# --- КЛАВИАТУРЫ ---
 
 async def check_subscription(user_id: int) -> bool:
     try:
@@ -347,7 +337,7 @@ def get_author_mention(user: types.User) -> str:
     return f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
 
 
-# --- ЛОГИКА ПУБЛИКАЦИИ В КАНАЛ ---
+# --- ЛОГИКА ПУБЛИКАЦИИ И ПЛАНИРОВЩИКА ---
 
 async def publish_ad_to_channel(ad_id: int):
     ad = get_ad(ad_id)
@@ -388,7 +378,7 @@ async def publish_ad_to_channel(ad_id: int):
 
     lead_id = channel_msg_ids[0]
     all_ids_str = ",".join(str(i) for i in channel_msg_ids)
-    save_published_ad(lead_channel_msg_id=lead_id, all_channel_msg_ids=all_ids_str, snippet=snippet)
+    save_published_ad(lead_channel_msg_id=lead_id, all_channel_msg_ids=all_ids_str, snippet=snippet or "")
 
     del_kb = InlineKeyboardBuilder()
     del_kb.button(text="🗑 Удалить объявление из канала", callback_data=f"del_pub:{lead_id}")
@@ -413,9 +403,6 @@ async def publish_ad_to_channel(ad_id: int):
         pass
 
 
-# --- МОДЕРАЦИЯ ЧАТА КОММЕНТАРИЕВ (ПРОВЕРКА ПОДПИСКИ) ---
-
-# 1. Запоминаем авто-репосты Telegram из канала в чат обсуждений
 @dp.message(F.is_automatic_forward)
 async def capture_discussion_forward(message: types.Message):
     orig_msg_id = None
@@ -432,62 +419,20 @@ async def capture_discussion_forward(message: types.Message):
         )
 
 
-# 2. Фильтр неподписанных пользователей в чате комментариев
-@dp.message(F.chat.type.in_({"group", "supergroup"}), ~F.is_automatic_forward)
-async def filter_comments_chat_subscribers(message: types.Message):
-    # Не фильтруем чат модерации
-    if message.chat.id == MODERATION_CHAT_ID:
-        return
-
-    # Игнорируем публикации от имени каналов и системные события
-    if message.sender_chat or not message.from_user:
-        return
-
-    # Не трогаем администраторов чата
-    try:
-        chat_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        if chat_member.status in ("creator", "administrator"):
-            return
-    except Exception:
-        pass
-
-    # Проверяем подписку автора на основной канал
-    is_sub = await check_subscription(message.from_user.id)
-    if not is_sub:
-        try:
-            await message.delete()
-            channel_clean = CHANNEL_ID.lstrip("@")
-            warning = await message.answer(
-                f"🌿 <b>{html.escape(message.from_user.first_name)}</b>, оставлять комментарии и общаться в чате "
-                f'могут только подписчики канала <a href="https://t.me/{channel_clean}">{CHANNEL_ID}</a>.\n\n'
-                f"Пожалуйста, подпишитесь на канал, чтобы ваши сообщения не удалялись!",
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            # Удаляем сервисное предупреждение через 7 секунд, чтобы чат оставался чистым
-            await asyncio.sleep(7)
-            await warning.delete()
-        except Exception as e:
-            print(f"Ошибка при модерации сообщения в чате комментариев: {e}")
-
-
-# --- УДАЛЕНИЕ ОБЪЯВЛЕНИЯ АВТОРОМ ---
-
 @dp.callback_query(F.data.startswith("del_pub:"))
 async def delete_published_ad_callback(callback: types.CallbackQuery):
     lead_id = int(callback.data.split(":")[1])
     pub_data = get_published_ad(lead_id)
 
-    if pub_data and pub_data["all_channel_msg_ids"]:
-        channel_msg_ids = [int(x) for x in pub_data["all_channel_msg_ids"].split(",") if x.strip()]
-        snippet = pub_data.get("snippet", "")
+    if pub_data:
+        all_ids_str, snippet = pub_data
+        channel_msg_ids = [int(x) for x in all_ids_str.split(",") if x.strip()]
     else:
         channel_msg_ids = [lead_id]
         snippet = ""
 
     deleted_any = False
 
-    # 1. Удаляем все медиа объявления из канала
     for c_id in channel_msg_ids:
         try:
             await bot.delete_message(chat_id=CHANNEL_ID, message_id=c_id)
@@ -495,7 +440,6 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
         except Exception:
             pass
 
-        # 2. Удаляем пост-обсуждение из чата комментариев
         mapping = get_discussion_mapping(c_id)
         if mapping:
             disc_chat_id, disc_msg_id = mapping
@@ -508,23 +452,20 @@ async def delete_published_ad_callback(callback: types.CallbackQuery):
     delete_published_ad(lead_id)
 
     if deleted_any:
-        preview_block = ""
+        quote_block = ""
         if snippet:
-            short_snippet = snippet.strip()
-            if len(short_snippet) > 180:
-                short_snippet = short_snippet[:180] + "..."
-            preview_block = f"\n\n🌿 <b>Удалённое объявление:</b>\n<blockquote>{html.escape(short_snippet)}</blockquote>"
+            raw_snippet = snippet.strip()
+            short_snippet = raw_snippet[:180] + "..." if len(raw_snippet) > 180 else raw_snippet
+            quote_block = f"\n\n🌿 <b>Удалённое объявление:</b>\n<blockquote>{html.escape(short_snippet)}</blockquote>"
 
         await callback.message.edit_text(
-            f"✅ Ваше объявление успешно удалено из канала и комментариев.{preview_block}",
+            f"✅ Ваше объявление успешно удалено из канала и комментариев.{quote_block}",
             parse_mode="HTML"
         )
         await callback.answer("Объявление удалено!")
     else:
         await callback.answer("⚠️ Не удалось удалить (возможно, оно уже было удалено).", show_alert=True)
 
-
-# --- ФОНОВЫЙ ПЛАНИРОВЩИК ПУБЛИКАЦИЙ ---
 
 async def scheduler_worker():
     while True:
@@ -548,7 +489,7 @@ async def scheduler_worker():
         await asyncio.sleep(15)
 
 
-# --- ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ (АНКЕТА В ЛС) ---
+# --- ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ (АНКЕТА) ---
 
 async def start_ad_creation(target: types.Message | types.CallbackQuery, state: FSMContext):
     text = (
@@ -610,11 +551,12 @@ async def location_chosen(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text.strip())
     await message.answer(
         "Шаг 3 из 3: Отправьте <b>описание объявления</b>.\n\n"
-        "💡 Вы можете прислать текст или <b>от 1 до 10 фотографий</b> (с описанием в подписи к фото).",
+        "💡 Вы можете прислать просто текст или <b>от 1 до 10 фотографий</b> (с описанием в подписи к фото).",
         parse_mode="HTML"
     )
     await state.set_state(AdForm.content)
 
+# Корректный ввод фото или текста
 @dp.message(AdForm.content, F.photo | F.text)
 async def content_received(message: types.Message, state: FSMContext, album: list[types.Message] | None = None):
     photo_ids = []
@@ -673,12 +615,22 @@ async def content_received(message: types.Message, state: FSMContext, album: lis
 
     await state.set_state(AdForm.confirmation)
 
+# Перехват видео, файлов, стикеров и других неподдерживаемых форматов
+@dp.message(AdForm.content)
+async def unsupported_media_received(message: types.Message):
+    await message.reply(
+        "⚠️ <b>Видео и файлы пока не поддерживаются.</b>\n\n"
+        "Пожалуйста, отправьте <b>фотографию растения</b> (до 10 шт. с описанием в подписи) "
+        "или просто <b>текстовое сообщение</b>.",
+        parse_mode="HTML"
+    )
+
 @dp.callback_query(AdForm.confirmation, F.data == "confirm_send")
 async def confirm_send_callback(callback: types.CallbackQuery, state: FSMContext):
     if not await check_subscription(callback.from_user.id):
         await state.clear()
         await callback.message.answer(
-            "⚠️ Вы не подписаны на канал. Подпишитесь, чтобы отправить объявление:",
+            "⚠️️ Вы не подписаны на канал. Подпишитесь, чтобы отправить объявление:",
             reply_markup=get_subscribe_keyboard()
         )
         await callback.answer()
@@ -966,7 +918,7 @@ async def reschedule_relative_handler(callback: types.CallbackQuery):
 
     post = get_scheduled_post(post_id)
     if not post:
-        await callback.answer("⚠️ Этот пост уже опубликован или отменён!", show_alert=True)
+        await callback.answer("⚠️️ Этот пост уже опубликован или отменён!", show_alert=True)
         await callback.message.edit_reply_markup(reply_markup=None)
         return
 
@@ -1097,7 +1049,7 @@ async def main():
         types.BotCommand(command="start", description="Подать объявление"),
         types.BotCommand(command="cancel", description="Отменить заполнение")
     ])
-    print("Бот успешно запущен: альбомы, очереди, удаление и модерация чата комментариев активны!")
+    print("Бот успешно запущен...")
     await dp.start_polling(bot)
 
 
